@@ -584,6 +584,9 @@ export const loadBoard = createServerFn({ method: "GET" })
     const attendance = await sql<{ class_id: string; day: string; status: string }>`
       select class_id, day, status from attendance where user_id = ${context.userId}
     `;
+    const counts = await sql<{ subject: string; attended: number; held: number }>`
+      select subject, attended, held from subject_counts where user_id = ${context.userId}
+    `;
     return {
       classes,
       assignments: assignments.map((row) => ({ ...row, done: on(row.done) })),
@@ -610,6 +613,11 @@ export const loadBoard = createServerFn({ method: "GET" })
       attendance: attendance
         .filter((row) => row.status === "present" || row.status === "absent" || row.status === "none")
         .map((row) => ({ classId: row.class_id, day: row.day, status: row.status as "present" | "absent" | "none" })),
+      counts: counts.map((row) => ({
+        subject: row.subject,
+        attended: Number(row.attended) || 0,
+        held: Number(row.held) || 0,
+      })),
     };
   });
 
@@ -695,6 +703,104 @@ export const deleteClass = createServerFn({ method: "POST" })
   .handler(async ({ context, data: id }) => {
     const { sql } = await requireRole(context.userId, "cadet");
     await sql`delete from classes where id = ${id} and user_id = ${context.userId}`;
+    return { ok: true as const };
+  });
+
+function wholeCount(value: number | null, label: string) {
+  if (value === null || value === undefined || (value as unknown) === "") return 0;
+  const count = Math.round(Number(value));
+  if (!Number.isInteger(count) || count < 0 || count > 999) return fail(`${label} has to be a whole number.`);
+  return count;
+}
+
+function tallyDelta(prev: string, next: string) {
+  const weight = (status: string) => ({
+    attended: status === "present" ? 1 : 0,
+    held: status === "present" || status === "absent" ? 1 : 0,
+  });
+  const before = weight(prev);
+  const after = weight(next);
+  return { attended: after.attended - before.attended, held: after.held - before.held };
+}
+
+export const saveSubject = createServerFn({ method: "POST" })
+  .middleware([cadetGate])
+  .validator(
+    (input: { previous: string; subject: string; days: string[]; attended: number | null; held: number | null }) =>
+      input,
+  )
+  .handler(async ({ context, data }) => {
+    const subject = (data.subject ?? "").trim().slice(0, 80);
+    if (!subject) return fail("Name the subject.");
+    const days = [...new Set((data.days ?? []).filter((day) => DAYS.includes(day as (typeof DAYS)[number])))];
+    if (!days.length) return fail("Pick at least one day.");
+    const attended = wholeCount(data.attended, "Attended");
+    if (typeof attended !== "number") return attended;
+    const held = wholeCount(data.held, "Taken");
+    if (typeof held !== "number") return held;
+    if (attended > held) return fail("Attended can't be more than classes taken.");
+    const previous = (data.previous ?? "").trim();
+    const { sql } = await requireRole(context.userId, "cadet");
+    const existing = await sql<{ id: string; day: string; subject: string }>`
+      select id, day, subject from classes where user_id = ${context.userId} and subject <> ''
+    `;
+    const key = subject.toLowerCase();
+    const prevKey = previous.toLowerCase();
+    const clash = existing.some((row) => {
+      const name = row.subject.trim().toLowerCase();
+      return name === key && name !== prevKey;
+    });
+    if (clash) return fail("That subject is already on the timetable.");
+    const mine = previous ? existing.filter((row) => row.subject.trim().toLowerCase() === prevKey) : [];
+    const byDay = new Map<string, { id: string }[]>();
+    for (const row of mine) {
+      const list = byDay.get(row.day) ?? [];
+      list.push(row);
+      byDay.set(row.day, list);
+    }
+    for (const day of days) {
+      const rows = byDay.get(day) ?? [];
+      if (rows[0]) {
+        await sql`
+          update classes set subject = ${subject}
+          where id = ${rows[0].id} and user_id = ${context.userId}
+        `;
+        for (const extra of rows.slice(1)) {
+          await sql`delete from classes where id = ${extra.id} and user_id = ${context.userId}`;
+        }
+      } else {
+        await sql`
+          insert into classes (id, user_id, day, time, subject, room, position)
+          values (${crypto.randomUUID()}, ${context.userId}, ${day}, '', ${subject}, '', 0)
+        `;
+      }
+    }
+    for (const [day, rows] of byDay) {
+      if (days.includes(day)) continue;
+      for (const row of rows) {
+        await sql`delete from classes where id = ${row.id} and user_id = ${context.userId}`;
+      }
+    }
+    await sql`
+      delete from subject_counts
+      where user_id = ${context.userId} and lower(subject) = ${previous ? prevKey : key}
+    `;
+    await sql`
+      insert into subject_counts (user_id, subject, attended, held)
+      values (${context.userId}, ${subject}, ${attended}, ${held})
+    `;
+    return { ok: true as const };
+  });
+
+export const deleteSubject = createServerFn({ method: "POST" })
+  .middleware([cadetGate])
+  .validator((name: string) => name)
+  .handler(async ({ context, data }) => {
+    const key = (data ?? "").trim().toLowerCase();
+    if (!key) return fail("Name the subject.");
+    const { sql } = await requireRole(context.userId, "cadet");
+    await sql`delete from classes where user_id = ${context.userId} and lower(subject) = ${key}`;
+    await sql`delete from subject_counts where user_id = ${context.userId} and lower(subject) = ${key}`;
     return { ok: true as const };
   });
 
@@ -1076,23 +1182,52 @@ export const setAttendance = createServerFn({ method: "POST" })
       return fail("Pick present, absent, or no class.");
     }
     const { sql } = await requireRole(context.userId, "cadet");
-    const owned = await sql<{ id: string }>`
-      select id from classes where id = ${classId} and user_id = ${context.userId}
+    const owned = await sql<{ id: string; day: string; subject: string }>`
+      select id, day, subject from classes where id = ${classId} and user_id = ${context.userId}
     `;
-    if (!owned[0]) return fail("That class is not on your timetable.");
-    if (status === "clear") {
-      await sql`
-        delete from attendance
-        where user_id = ${context.userId} and class_id = ${classId} and day = ${day}
-      `;
-      return { ok: true as const };
-    }
+    const slot = owned[0];
+    if (!slot || !slot.subject.trim()) return fail("That class is not on your timetable.");
+    const key = slot.subject.trim().toLowerCase();
+    const siblings = await sql<{ id: string }>`
+      select id from classes
+      where user_id = ${context.userId} and day = ${slot.day} and lower(subject) = ${key}
+    `;
+    const ids = siblings.map((row) => row.id);
+    const marks = await sql<{ class_id: string; status: string }>`
+      select class_id, status from attendance
+      where user_id = ${context.userId} and day = ${day}
+    `;
+    const prevs = marks.filter((row) => ids.includes(row.class_id)).map((row) => row.status);
+    const prev = prevs.includes("present") ? "present" : prevs.includes("absent") ? "absent" : prevs.includes("none") ? "none" : "clear";
+    const delta = tallyDelta(prev, status === "clear" ? "clear" : status);
+    const stored = await sql<{ attended: number; held: number; subject: string }>`
+      select attended, held, subject from subject_counts
+      where user_id = ${context.userId} and lower(subject) = ${key}
+    `;
+    const attended = Math.max(0, (Number(stored[0]?.attended) || 0) + delta.attended);
+    let held = Math.max(0, (Number(stored[0]?.held) || 0) + delta.held);
+    if (attended > held) held = attended;
+    const label = stored[0]?.subject || slot.subject.trim();
+    await sql`delete from subject_counts where user_id = ${context.userId} and lower(subject) = ${key}`;
     await sql`
-      insert into attendance (user_id, class_id, day, status)
-      values (${context.userId}, ${classId}, ${day}, ${status})
-      on conflict (user_id, class_id, day) do update set status = excluded.status
+      insert into subject_counts (user_id, subject, attended, held)
+      values (${context.userId}, ${label}, ${attended}, ${held})
     `;
-    return { ok: true as const };
+    for (const id of ids) {
+      if (status === "clear") {
+        await sql`
+          delete from attendance
+          where user_id = ${context.userId} and class_id = ${id} and day = ${day}
+        `;
+      } else {
+        await sql`
+          insert into attendance (user_id, class_id, day, status)
+          values (${context.userId}, ${id}, ${day}, ${status})
+          on conflict (user_id, class_id, day) do update set status = excluded.status
+        `;
+      }
+    }
+    return { ok: true as const, subject: label, attended, held };
   });
 
 function normalizeDay(raw: string) {

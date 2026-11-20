@@ -4,13 +4,12 @@ import { signOut } from "@/lib/auth/client";
 import { loginEnabled } from "@/lib/atlas/gate";
 import {
   addAssignment,
-  addClass,
   addCourse,
   askAtlas,
   clearChat,
   deleteAssignment,
-  deleteClass,
   deleteCourse,
+  deleteSubject,
   importAcademics,
   importTimetable,
   loadBoard,
@@ -18,17 +17,25 @@ import {
   markAskOpened,
   noteAsk,
   saveAiPrefs,
+  saveSubject,
   setAttendance as saveAttendance,
   setPulseEnabled,
   summarizeNotes,
   updateAssignment,
-  updateClass,
   updateCourse,
 } from "@/lib/atlas/server";
 import { Card, GhostButton, Notice, PrimaryButton, inputClass } from "./ui";
 import { FocusDock, formatFocus, type FocusActive, type FocusRecent } from "./focus-dock";
 
 type ClassRow = { id: string; day: string; time: string; subject: string; room: string };
+type CountRow = { subject: string; attended: number; held: number };
+type SubjectGroup = {
+  key: string;
+  name: string;
+  days: string[];
+  attended: number;
+  held: number;
+};
 type Assignment = { id: string; title: string; subject: string; due: string; done: boolean };
 type Course = { id: string; name: string; credits: number; grade: string };
 type Chat = { id: string; role: string; content: string };
@@ -44,6 +51,152 @@ type PendingFile = {
 type Tab = "overview" | "timetable" | "assignments" | "academics" | "ai" | "settings";
 
 const DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+function groupSubjects(classes: ClassRow[], counts: CountRow[]): SubjectGroup[] {
+  const order: string[] = [];
+  const map = new Map<string, SubjectGroup>();
+  for (const row of classes) {
+    const name = row.subject.trim();
+    const key = name.toLowerCase();
+    if (!key) continue;
+    let group = map.get(key);
+    if (!group) {
+      const count = counts.find((item) => item.subject.trim().toLowerCase() === key);
+      group = {
+        key,
+        name,
+        days: [],
+        attended: count?.attended ?? 0,
+        held: count?.held ?? 0,
+      };
+      map.set(key, group);
+      order.push(key);
+    }
+    if (!group.days.includes(row.day)) group.days.push(row.day);
+  }
+  for (const group of map.values()) {
+    group.days.sort((a, b) => DAYS.indexOf(a) - DAYS.indexOf(b));
+  }
+  return order.map((key) => map.get(key)!);
+}
+
+function subjectsOn(rows: ClassRow[], dayName: string) {
+  const seen = new Set<string>();
+  const out: ClassRow[] = [];
+  for (const row of rows) {
+    if (row.day !== dayName || !row.subject.trim()) continue;
+    const key = row.subject.trim().toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(row);
+  }
+  return out.sort((a, b) => a.subject.localeCompare(b.subject));
+}
+
+function slotStatus(ids: string[], day: string, marks: AttendanceMark[]) {
+  const statuses = marks.filter((mark) => ids.includes(mark.classId) && mark.day === day).map((mark) => mark.status);
+  if (statuses.includes("present")) return "present" as const;
+  if (statuses.includes("absent")) return "absent" as const;
+  if (statuses.includes("none")) return "none" as const;
+  return undefined;
+}
+
+function readCount(raw: string) {
+  const text = raw.trim();
+  if (!text) return null;
+  if (!/^\d+$/.test(text) || Number(text) > 999) throw new Error("Attended and taken have to be whole numbers.");
+  return Number(text);
+}
+
+function DayPicks({ days, onToggle }: { days: string[]; onToggle: (day: string) => void }) {
+  return (
+    <div className="flex flex-wrap gap-1">
+      {DAYS.map((day) => (
+        <button
+          key={day}
+          type="button"
+          onClick={() => onToggle(day)}
+          className={`inline-flex min-h-9 items-center px-2 text-xs tracking-[0.12em] uppercase ${
+            days.includes(day) ? "bg-fg text-bg" : "border border-border text-muted"
+          }`}
+        >
+          {day}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function SubjectCard({
+  group,
+  onSave,
+  onDelete,
+}: {
+  group: SubjectGroup;
+  onSave: (previous: string, subject: string, days: string[], attended: string, held: string) => Promise<void>;
+  onDelete: (name: string) => Promise<void>;
+}) {
+  const [name, setName] = useState(group.name);
+  const [attended, setAttended] = useState(String(group.attended));
+  const [held, setHeld] = useState(String(group.held));
+  useEffect(() => {
+    setName(group.name);
+    setAttended(String(group.attended));
+    setHeld(String(group.held));
+  }, [group.name, group.attended, group.held]);
+  return (
+    <Card className="space-y-3">
+      <div className="flex items-start gap-3">
+        <input
+          className={inputClass}
+          value={name}
+          aria-label="Subject"
+          onChange={(event) => setName(event.target.value)}
+          onBlur={() => void onSave(group.name, name, group.days, attended, held)}
+        />
+        <button
+          type="button"
+          aria-label="Delete subject"
+          className="inline-flex min-h-11 min-w-11 items-center justify-center text-muted hover:text-fg"
+          onClick={() => void onDelete(group.name)}
+        >
+          <Trash2 className="size-4" />
+        </button>
+      </div>
+      <DayPicks
+        days={group.days}
+        onToggle={(day) => {
+          const next = group.days.includes(day) ? group.days.filter((item) => item !== day) : [...group.days, day];
+          void onSave(group.name, name, next, attended, held);
+        }}
+      />
+      <div className="grid gap-3 sm:grid-cols-2">
+        <label className="block space-y-1">
+          <span className="text-xs tracking-[0.16em] text-muted uppercase">Attended</span>
+          <input
+            className={inputClass}
+            type="number"
+            min={0}
+            value={attended}
+            onChange={(event) => setAttended(event.target.value)}
+            onBlur={() => void onSave(group.name, name, group.days, attended, held)}
+          />
+        </label>
+        <label className="block space-y-1">
+          <span className="text-xs tracking-[0.16em] text-muted uppercase">Taken</span>
+          <input
+            className={inputClass}
+            type="number"
+            min={0}
+            value={held}
+            onChange={(event) => setHeld(event.target.value)}
+            onBlur={() => void onSave(group.name, name, group.days, attended, held)}
+          />
+        </label>
+      </div>
+    </Card>
+  );
+}
 const GRADES = ["S", "A", "B", "C", "D", "E", "F"];
 const POINTS: Record<string, number> = { S: 10, A: 9, B: 8, C: 7, D: 6, E: 5, F: 0 };
 
@@ -348,7 +501,12 @@ export function CadetApp({ displayName }: { displayName: string }) {
   const [chatFiles, setChatFiles] = useState<PendingFile[]>([]);
   const [noteFiles, setNoteFiles] = useState<PendingFile[]>([]);
   const [attendance, setAttendanceRows] = useState<AttendanceMark[]>([]);
+  const [counts, setCounts] = useState<CountRow[]>([]);
   const [attendDay, setAttendDay] = useState(kolkataToday);
+  const [draftSubject, setDraftSubject] = useState("");
+  const [draftDays, setDraftDays] = useState<string[]>([]);
+  const [draftAttended, setDraftAttended] = useState("");
+  const [draftHeld, setDraftHeld] = useState("");
   const [timetableText, setTimetableText] = useState("");
   const [timetableFiles, setTimetableFiles] = useState<PendingFile[]>([]);
   const [academicsText, setAcademicsText] = useState("");
@@ -378,6 +536,7 @@ export function CadetApp({ displayName }: { displayName: string }) {
     setFocusRecent(board.focus.recent);
     setFocusTotals(board.focus.totals);
     setAttendanceRows(board.attendance);
+    setCounts(board.counts);
   }
 
   useEffect(() => {
@@ -387,7 +546,7 @@ export function CadetApp({ displayName }: { displayName: string }) {
   }, []);
 
   const today = new Date().toLocaleDateString("en-US", { weekday: "short" });
-  const todayClasses = classes.filter((row) => row.day === today.slice(0, 3) && row.subject);
+  const todayClasses = subjectsOn(classes, today.slice(0, 3));
   const upcoming = useMemo(
     () =>
       assignments
@@ -410,34 +569,73 @@ export function CadetApp({ displayName }: { displayName: string }) {
     if (low.focusMs * 2 >= high.focusMs) return null;
     return `${low.label} has less recorded time than ${high.label}.`;
   })();
-  const attendClasses = classes
-    .filter((row) => row.day === weekdayOf(attendDay) && row.subject.trim())
-    .slice()
-    .sort((a, b) => a.time.localeCompare(b.time));
-  const counted = attendance.filter((row) => row.status === "present" || row.status === "absent");
-  const presentCount = counted.filter((row) => row.status === "present").length;
-  const dayMarks = attendance.filter((row) => row.day === attendDay);
-  const dayPresent = dayMarks.filter((row) => row.status === "present").length;
-  const dayAbsent = dayMarks.filter((row) => row.status === "absent").length;
+  const subjectGroups = groupSubjects(classes, counts);
+  const attendClasses = subjectsOn(classes, weekdayOf(attendDay));
+  const dayPresent = attendClasses.filter((row) => {
+    const ids = classes
+      .filter((item) => item.day === row.day && item.subject.trim().toLowerCase() === row.subject.trim().toLowerCase())
+      .map((item) => item.id);
+    return slotStatus(ids, attendDay, attendance) === "present";
+  }).length;
+  const dayAbsent = attendClasses.filter((row) => {
+    const ids = classes
+      .filter((item) => item.day === row.day && item.subject.trim().toLowerCase() === row.subject.trim().toLowerCase())
+      .map((item) => item.id);
+    return slotStatus(ids, attendDay, attendance) === "absent";
+  }).length;
+  const totalAttended = subjectGroups.reduce((sum, row) => sum + row.attended, 0);
+  const totalHeld = subjectGroups.reduce((sum, row) => sum + row.held, 0);
   const attendLine = [
     dayPresent || dayAbsent ? `${dayPresent} present · ${dayAbsent} absent` : "",
-    counted.length ? `${Math.round((100 * presentCount) / counted.length)}% overall` : "",
+    totalHeld ? `${totalAttended}/${totalHeld} · ${Math.round((100 * totalAttended) / totalHeld)}%` : "",
   ]
     .filter(Boolean)
     .join(" · ");
 
   function markAttendance(classId: string, status: "present" | "absent" | "none") {
-    const current = attendance.find((row) => row.classId === classId && row.day === attendDay)?.status;
+    const row = classes.find((item) => item.id === classId);
+    if (!row) return;
+    const ids = classes
+      .filter((item) => item.day === row.day && item.subject.trim().toLowerCase() === row.subject.trim().toLowerCase())
+      .map((item) => item.id);
+    const current = slotStatus(ids, attendDay, attendance);
     const next = current === status ? "clear" : status;
     setAttendanceRows((rows) => {
-      const rest = rows.filter((row) => !(row.classId === classId && row.day === attendDay));
-      return next === "clear" ? rest : [...rest, { classId, day: attendDay, status: next }];
+      const rest = rows.filter((item) => !(ids.includes(item.classId) && item.day === attendDay));
+      return next === "clear"
+        ? rest
+        : [...rest, ...ids.map((id) => ({ classId: id, day: attendDay, status: next }))];
     });
     void saveAttendance({ data: { classId, day: attendDay, status: next } })
       .then((result) => {
-        if (!result.ok) setError(result.error);
+        if (!result.ok) {
+          setError(result.error);
+          return;
+        }
+        setCounts((rows) => {
+          const key = result.subject.trim().toLowerCase();
+          const rest = rows.filter((item) => item.subject.trim().toLowerCase() !== key);
+          return [...rest, { subject: result.subject, attended: result.attended, held: result.held }];
+        });
       })
       .catch((err: unknown) => setError(err instanceof Error ? err.message : "Could not save attendance"));
+  }
+
+  async function commitSubject(
+    previous: string,
+    subject: string,
+    days: string[],
+    attendedRaw: string,
+    heldRaw: string,
+  ) {
+    const subjectName = subject.trim();
+    if (!subjectName) throw new Error("Name the subject.");
+    if (!days.length) throw new Error("Pick at least one day.");
+    const attended = readCount(attendedRaw);
+    const held = readCount(heldRaw);
+    const result = await saveSubject({ data: { previous, subject: subjectName, days, attended, held } });
+    if (!result.ok) throw new Error(result.error);
+    await refresh();
   }
 
   async function addUploads(
@@ -629,15 +827,23 @@ export function CadetApp({ displayName }: { displayName: string }) {
                 <p className="text-sm text-muted">
                   {classes.some((row) => row.subject.trim())
                     ? "No classes on the timetable for this day."
-                    : "Import a timetable first. Attendance uses those classes."}
+                    : "Add a subject on the timetable first."}
                 </p>
               ) : (
                 <div>
                   {attendClasses.map((row) => {
-                    const status = attendance.find((mark) => mark.classId === row.id && mark.day === attendDay)?.status;
+                    const ids = classes
+                      .filter(
+                        (item) =>
+                          item.day === row.day &&
+                          item.subject.trim().toLowerCase() === row.subject.trim().toLowerCase(),
+                      )
+                      .map((item) => item.id);
+                    const status = slotStatus(ids, attendDay, attendance);
+                    const tally = subjectGroups.find((item) => item.key === row.subject.trim().toLowerCase());
                     return (
                       <div
-                        key={row.id}
+                        key={row.subject}
                         className="flex flex-col gap-2 border-b border-border py-2 sm:flex-row sm:items-center"
                       >
                         <div className="flex flex-wrap gap-1">
@@ -661,8 +867,11 @@ export function CadetApp({ displayName }: { displayName: string }) {
                           ))}
                         </div>
                         <p className="text-sm">
-                          <span className="tabular-nums text-muted">{row.time}</span> {row.subject}
-                          {row.room ? <span className="text-muted"> · {row.room}</span> : null}
+                          {row.subject}
+                          <span className="text-muted">
+                            {" "}
+                            · {tally?.attended ?? 0}/{tally?.held ?? 0}
+                          </span>
                         </p>
                       </div>
                     );
@@ -683,9 +892,8 @@ export function CadetApp({ displayName }: { displayName: string }) {
                   <p className="text-sm text-muted">No classes on the board for today.</p>
                 ) : (
                   todayClasses.map((row) => (
-                    <p key={row.id} className="border-b border-border py-1.5 text-sm last:border-0">
-                      <span className="tabular-nums text-muted">{row.time}</span> {row.subject}
-                      {row.room ? <span className="text-muted"> · {row.room}</span> : null}
+                    <p key={row.subject} className="border-b border-border py-1.5 text-sm last:border-0">
+                      {row.subject}
                     </p>
                   ))
                 )}
@@ -738,23 +946,7 @@ export function CadetApp({ displayName }: { displayName: string }) {
 
         {!loading && tab === "timetable" ? (
           <div className="space-y-4">
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <h2 className="text-3xl font-medium tracking-tight">Timetable</h2>
-              <PrimaryButton
-                disabled={busy}
-                onClick={() =>
-                  run(async () => {
-                    const created = await addClass();
-                    setClasses((rows) => [
-                      ...rows,
-                      { id: created.id, day: "Mon", time: "09:00", subject: "", room: "" },
-                    ]);
-                  })
-                }
-              >
-                <Plus className="mr-1 size-4" /> Add class
-              </PrimaryButton>
-            </div>
+            <h2 className="text-3xl font-medium tracking-tight">Timetable</h2>
             <Card className="space-y-3">
               <div className="text-xs tracking-[0.16em] text-muted uppercase">Import</div>
               <textarea
@@ -854,67 +1046,79 @@ export function CadetApp({ displayName }: { displayName: string }) {
                 ) : null}
               </div>
             </Card>
+            <Card className="space-y-3">
+              <div className="text-xs tracking-[0.16em] text-muted uppercase">Add a subject</div>
+              <input
+                className={inputClass}
+                placeholder="Subject"
+                value={draftSubject}
+                onChange={(event) => setDraftSubject(event.target.value)}
+              />
+              <DayPicks
+                days={draftDays}
+                onToggle={(day) =>
+                  setDraftDays((days) => (days.includes(day) ? days.filter((item) => item !== day) : [...days, day]))
+                }
+              />
+              <div className="grid gap-3 sm:grid-cols-2">
+                <label className="block space-y-1">
+                  <span className="text-xs tracking-[0.16em] text-muted uppercase">Attended</span>
+                  <input
+                    className={inputClass}
+                    type="number"
+                    min={0}
+                    placeholder="0"
+                    value={draftAttended}
+                    onChange={(event) => setDraftAttended(event.target.value)}
+                  />
+                </label>
+                <label className="block space-y-1">
+                  <span className="text-xs tracking-[0.16em] text-muted uppercase">Taken</span>
+                  <input
+                    className={inputClass}
+                    type="number"
+                    min={0}
+                    placeholder="0"
+                    value={draftHeld}
+                    onChange={(event) => setDraftHeld(event.target.value)}
+                  />
+                </label>
+              </div>
+              <p className="text-sm text-muted">
+                Attended and taken are optional. Leave them empty if this subject has not been held yet.
+              </p>
+              <PrimaryButton
+                disabled={busy}
+                onClick={() =>
+                  void run(async () => {
+                    await commitSubject("", draftSubject, draftDays, draftAttended, draftHeld);
+                    setDraftSubject("");
+                    setDraftDays([]);
+                    setDraftAttended("");
+                    setDraftHeld("");
+                  })
+                }
+              >
+                Add subject
+              </PrimaryButton>
+            </Card>
             <div className="space-y-3">
-              {classes.length === 0 ? <p className="text-sm text-muted">No classes yet.</p> : null}
-              {classes.map((row) => (
-                <Card key={row.id} className="grid gap-2 sm:grid-cols-[7rem_7rem_1fr_8rem_auto] sm:items-center">
-                  <select
-                    className={inputClass}
-                    value={row.day}
-                    onChange={(event) => {
-                      const day = event.target.value;
-                      setClasses((rows) => rows.map((item) => (item.id === row.id ? { ...item, day } : item)));
-                      void updateClass({ data: { ...row, day } });
-                    }}
-                  >
-                    {DAYS.map((day) => (
-                      <option key={day}>{day}</option>
-                    ))}
-                  </select>
-                  <input
-                    className={inputClass}
-                    type="time"
-                    value={row.time}
-                    onChange={(event) => {
-                      const time = event.target.value;
-                      setClasses((rows) => rows.map((item) => (item.id === row.id ? { ...item, time } : item)));
-                    }}
-                    onBlur={(event) => void updateClass({ data: { ...row, time: event.target.value } })}
-                  />
-                  <input
-                    className={inputClass}
-                    placeholder="Subject"
-                    value={row.subject}
-                    onChange={(event) => {
-                      const subject = event.target.value;
-                      setClasses((rows) => rows.map((item) => (item.id === row.id ? { ...item, subject } : item)));
-                    }}
-                    onBlur={(event) => void updateClass({ data: { ...row, subject: event.target.value } })}
-                  />
-                  <input
-                    className={inputClass}
-                    placeholder="Room"
-                    value={row.room}
-                    onChange={(event) => {
-                      const room = event.target.value;
-                      setClasses((rows) => rows.map((item) => (item.id === row.id ? { ...item, room } : item)));
-                    }}
-                    onBlur={(event) => void updateClass({ data: { ...row, room: event.target.value } })}
-                  />
-                  <button
-                    type="button"
-                    aria-label="Delete class"
-                    className="inline-flex min-h-11 min-w-11 items-center justify-center text-muted hover:text-fg"
-                    onClick={() =>
-                      run(async () => {
-                        await deleteClass({ data: row.id });
-                        setClasses((rows) => rows.filter((item) => item.id !== row.id));
-                      })
-                    }
-                  >
-                    <Trash2 className="size-4" />
-                  </button>
-                </Card>
+              {subjectGroups.length === 0 ? <p className="text-sm text-muted">No subjects yet.</p> : null}
+              {subjectGroups.map((group) => (
+                <SubjectCard
+                  key={group.key}
+                  group={group}
+                  onSave={(previous, subject, days, attended, held) =>
+                    run(() => commitSubject(previous, subject, days, attended, held))
+                  }
+                  onDelete={(name) =>
+                    run(async () => {
+                      const result = await deleteSubject({ data: name });
+                      if (!result.ok) throw new Error(result.error);
+                      await refresh();
+                    })
+                  }
+                />
               ))}
             </div>
           </div>
