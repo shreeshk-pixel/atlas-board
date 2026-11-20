@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#000000">
+
+    <WebView
+        android:id="@+id/board"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent" />
+
+    <LinearLayout
+        android:id="@+id/gate"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="vertical"
+        android:padding="24dp"
+        android:background="#000000"
+        android:gravity="center">
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="ATLAS"
+            android:textColor="#FFFFFF"
+            android:textSize="28sp"
+            android:letterSpacing="0.12" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text="Paste the address from the Windows window title, or the website once it is hosted. Phone and computer must be on the same Wi-Fi for a home address."
+            android:textColor="#8B8B8B"
+            android:textSize="14sp" />
+
+        <EditText
+            android:id="@+id/address"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="20dp"
+            android:hint="http://192.168.0.10:47321"
+            android:inputType="textUri"
+            android:textColor="#FFFFFF"
+            android:textColorHint="#8B8B8B"
+            android:backgroundTint="#FFFFFF"
+            android:singleLine="true" />
+
+        <Button
+            android:id="@+id/open"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="Open the board"
+            android:textColor="#000000"
+            android:backgroundTint="#FFFFFF" />
+    </LinearLayout>
+</FrameLayout>

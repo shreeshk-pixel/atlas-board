@@ -1,14 +1,17 @@
 {
   "name": "app-builder-workspace",
+  "version": "0.1.0",
   "private": true,
   "sideEffects": false,
   "type": "module",
+  "main": "desktop/main.cjs",
   "overrides": {
     "nf3": "0.3.17"
   },
   "scripts": {
     "dev": "node scripts/with-app-env.mjs vite dev --host 0.0.0.0 --port 8080",
     "build": "node scripts/with-app-env.mjs vite build && npm run db:migrate && cp node_modules/@electric-sql/pglite/dist/pglite.data node_modules/@electric-sql/pglite/dist/pglite.wasm node_modules/@electric-sql/pglite/dist/initdb.wasm .vercel/output/functions/__server.func/_libs/",
+    "build:desktop": "NITRO_PRESET=node-server node scripts/with-app-env.mjs vite build && cp node_modules/@electric-sql/pglite/dist/pglite.data node_modules/@electric-sql/pglite/dist/pglite.wasm node_modules/@electric-sql/pglite/dist/initdb.wasm .output/server/_libs/",
     "db:migrate": "node scripts/migrate.mjs",
     "build:dev": "node scripts/with-app-env.mjs vite build --mode development",
     "preview": "node scripts/with-app-env.mjs vite preview",
@@ -84,6 +87,8 @@
     "@types/pg": "^8.11.10",
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",
+    "electron": "^33.4.11",
+    "electron-builder": "^25.1.8",
     "eslint": "^9.20.0",
     "eslint-config-prettier": "^10.1.1",
     "eslint-plugin-prettier": "^5.2.6",
@@ -93,5 +98,29 @@
     "playwright": "^1.62.0",
     "prettier": "^3.4.0",
     "typescript-eslint": "^8.56.1"
+  },
+  "build": {
+    "appId": "app.atlas.board",
+    "productName": "ATLAS",
+    "asar": false,
+    "npmRebuild": false,
+    "directories": {
+      "output": "dist-desktop"
+    },
+    "files": [
+      "desktop/**/*",
+      ".output/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "zip",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    }
   }
 }
