@@ -1140,14 +1140,21 @@ function normalizeTime(raw: string) {
 
 export const importTimetable = createServerFn({ method: "POST" })
   .middleware([cadetGate])
-  .validator((input: { text: string; image: string | null; mode: "replace" | "append" }) => input)
+  .validator(
+    (input: { text: string; image: string | null; files?: IncomingFile[]; mode: "replace" | "append" }) =>
+      input,
+  )
   .handler(async ({ context, data }) => {
     const text = (data.text ?? "").trim();
     const image = data.image ?? null;
-    if (!text && !image) return fail("Paste the timetable or upload a photo.");
+    const prepared = await takeFiles(data.files);
+    if (!prepared.ok) return prepared;
     if (text.length > 20000) return fail("That text is too long.");
     if (image && image.length > 2_000_000) return fail("That photo is too large. Crop it and try again.");
-    if (image && !image.startsWith("data:image/")) return fail("Upload a photo, not another file.");
+    if (image && !image.startsWith("data:image/")) return fail("That photo could not be read.");
+    const files = [...prepared.files];
+    if (image) files.push({ label: "photo", text: "", image });
+    if (!text && files.length === 0) return fail("Paste the timetable or upload a file.");
     const { sql } = await requireRole(context.userId, "cadet");
     const instruction = `Extract every scheduled class from this college timetable.
 Return ONLY a JSON array. No markdown.
@@ -1157,12 +1164,7 @@ time is the start time in 24-hour HH:MM.
 Skip lunch, break, free, and empty slots.
 If room is missing, use an empty string.
 Keep the subject name exactly as written.`;
-    const content = image
-      ? [
-          { type: "text", text: instruction + (text ? `\n\nExtra text:\n${text}` : "") },
-          { type: "image_url", image_url: { url: image } },
-        ]
-      : `${instruction}\n\nTimetable text:\n${text}`;
+    const content = modelContent(`${instruction}${text ? `\n\nExtra text:\n${text}` : ""}`, files);
     const result = await callLLM(sql, context.userId, [{ role: "user", content }], 0, 2000);
     if (!result.ok) return result;
     const raw = result.text.replace(/```json|```/g, "").trim();

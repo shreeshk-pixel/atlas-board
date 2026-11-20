@@ -1,5 +1,6 @@
 import mammoth from "mammoth";
 import JSZip from "jszip";
+import * as XLSX from "xlsx";
 import { extractText, getDocumentProxy } from "unpdf";
 
 export type IncomingFile = {
@@ -104,6 +105,17 @@ async function textFromFile(name: string, bytes: Buffer) {
     if (letters(text) < 20) throw new Error(`Could not read ${name}.`);
     return text;
   }
+  if (ext === "xlsx" || ext === "xls" || ext === "xlsm" || ext === "xlsb") {
+    const book = XLSX.read(bytes, { type: "buffer", cellDates: true });
+    const text = book.SheetNames.map((sheet) => {
+      const csv = XLSX.utils.sheet_to_csv(book.Sheets[sheet] ?? {});
+      return `${sheet}\n${csv}`;
+    })
+      .join("\n\n")
+      .trim();
+    if (text.length < 2) throw new Error(`Could not read ${name}.`);
+    return text;
+  }
   if (ext === "doc" || ext === "ppt") {
     const text = binaryText(bytes);
     if (letters(text) < 40) {
@@ -111,7 +123,7 @@ async function textFromFile(name: string, bytes: Buffer) {
     }
     return text;
   }
-  throw new Error(`${name} is not a PDF, PowerPoint, Word, text, or photo file.`);
+  throw new Error(`${name} is not a PDF, Excel, PowerPoint, Word, text, or photo file.`);
 }
 
 export async function prepareFiles(input: IncomingFile[] | undefined): Promise<

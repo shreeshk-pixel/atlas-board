@@ -48,7 +48,7 @@ const GRADES = ["S", "A", "B", "C", "D", "E", "F"];
 const POINTS: Record<string, number> = { S: 10, A: 9, B: 8, C: 7, D: 6, E: 5, F: 0 };
 
 const FILE_ACCEPT =
-  ".pdf,.ppt,.pptx,.pptm,.doc,.docx,.txt,.md,.csv,.png,.jpg,.jpeg,.webp,.gif,image/*,application/pdf";
+  ".pdf,.xls,.xlsx,.xlsm,.ppt,.pptx,.pptm,.doc,.docx,.txt,.md,.csv,.png,.jpg,.jpeg,.webp,.gif,image/*,application/pdf";
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "overview", label: "Overview" },
@@ -350,7 +350,7 @@ export function CadetApp({ displayName }: { displayName: string }) {
   const [attendance, setAttendanceRows] = useState<AttendanceMark[]>([]);
   const [attendDay, setAttendDay] = useState(kolkataToday);
   const [timetableText, setTimetableText] = useState("");
-  const [timetableImage, setTimetableImage] = useState<string | null>(null);
+  const [timetableFiles, setTimetableFiles] = useState<PendingFile[]>([]);
   const [academicsText, setAcademicsText] = useState("");
   const [academicsImage, setAcademicsImage] = useState<string | null>(null);
   const [skipped, setSkipped] = useState<{ day: string; label: string; tab: string } | null>(null);
@@ -759,30 +759,54 @@ export function CadetApp({ displayName }: { displayName: string }) {
               <div className="text-xs tracking-[0.16em] text-muted uppercase">Import</div>
               <textarea
                 className={`${inputClass} min-h-24 py-2`}
-                placeholder="Paste timetable text, or upload a photo."
+                placeholder="Paste the timetable, or upload a PDF, Excel, Word file, or a photo."
                 value={timetableText}
                 onChange={(event) => setTimetableText(event.target.value)}
               />
+              {timetableFiles.length > 0 ? (
+                <div className="flex flex-wrap gap-2">
+                  {timetableFiles.map((file) => (
+                    <button
+                      key={file.id}
+                      type="button"
+                      className="inline-flex min-h-9 items-center gap-2 border border-border px-2 text-xs text-muted"
+                      onClick={() => setTimetableFiles((rows) => rows.filter((item) => item.id !== file.id))}
+                    >
+                      {file.name}
+                      <span aria-hidden="true">×</span>
+                    </button>
+                  ))}
+                </div>
+              ) : null}
               <input
                 type="file"
-                accept="image/*"
+                multiple
+                accept={FILE_ACCEPT}
                 className="block w-full text-sm text-muted"
                 onChange={(event) => {
-                  const file = event.target.files?.[0];
-                  if (!file) return;
-                  resizeImage(file)
-                    .then(setTimetableImage)
-                    .catch((err: unknown) => setError(err instanceof Error ? err.message : "Photo failed"));
+                  const list = event.target.files;
+                  event.target.value = "";
+                  void run(() => addUploads(list, timetableFiles, setTimetableFiles));
                 }}
               />
-              {timetableImage ? <p className="text-sm text-muted">Photo ready.</p> : null}
               <div className="flex flex-wrap gap-2">
                 <PrimaryButton
                   disabled={busy}
                   onClick={() =>
                     run(async () => {
                       const result = await importTimetable({
-                        data: { text: timetableText, image: timetableImage, mode: "replace" },
+                        data: {
+                          text: timetableText,
+                          image: null,
+                          files: timetableFiles.map(({ name, kind, text, mime, data }) => ({
+                            name,
+                            kind,
+                            text,
+                            mime,
+                            data,
+                          })),
+                          mode: "replace",
+                        },
                       });
                       if (!result.ok) {
                         setError(result.error);
@@ -790,7 +814,7 @@ export function CadetApp({ displayName }: { displayName: string }) {
                       }
                       await refresh();
                       setTimetableText("");
-                      setTimetableImage(null);
+                      setTimetableFiles([]);
                     })
                   }
                 >
@@ -801,20 +825,32 @@ export function CadetApp({ displayName }: { displayName: string }) {
                   onClick={() =>
                     run(async () => {
                       const result = await importTimetable({
-                        data: { text: timetableText, image: timetableImage, mode: "append" },
+                        data: {
+                          text: timetableText,
+                          image: null,
+                          files: timetableFiles.map(({ name, kind, text, mime, data }) => ({
+                            name,
+                            kind,
+                            text,
+                            mime,
+                            data,
+                          })),
+                          mode: "append",
+                        },
                       });
                       if (!result.ok) {
                         setError(result.error);
                         return;
                       }
                       await refresh();
+                      setTimetableFiles([]);
                     })
                   }
                 >
                   Extract and add
                 </GhostButton>
-                {timetableImage ? (
-                  <GhostButton onClick={() => setTimetableImage(null)}>Clear photo</GhostButton>
+                {timetableFiles.length > 0 ? (
+                  <GhostButton onClick={() => setTimetableFiles([])}>Clear files</GhostButton>
                 ) : null}
               </div>
             </Card>
