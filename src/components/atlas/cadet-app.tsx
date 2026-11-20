@@ -441,13 +441,13 @@ export function CadetApp({ displayName }: { displayName: string }) {
   }
 
   async function addUploads(
-    list: FileList | null,
+    list: File[],
     current: PendingFile[],
     set: (files: PendingFile[]) => void,
   ) {
-    if (!list?.length) return;
+    if (!list.length) return;
     const next = [...current];
-    for (const file of Array.from(list)) {
+    for (const file of list) {
       if (next.length >= 4) throw new Error("Attach up to 4 files.");
       next.push(await readUpload(file));
     }
@@ -784,7 +784,7 @@ export function CadetApp({ displayName }: { displayName: string }) {
                 accept={FILE_ACCEPT}
                 className="block w-full text-sm text-muted"
                 onChange={(event) => {
-                  const list = event.target.files;
+                  const list = Array.from(event.target.files ?? []);
                   event.target.value = "";
                   void run(() => addUploads(list, timetableFiles, setTimetableFiles));
                 }}
@@ -1204,7 +1204,7 @@ export function CadetApp({ displayName }: { displayName: string }) {
                 accept={FILE_ACCEPT}
                 className="block w-full text-sm text-muted"
                 onChange={(event) => {
-                  const list = event.target.files;
+                  const list = Array.from(event.target.files ?? []);
                   event.target.value = "";
                   void run(() => addUploads(list, chatFiles, setChatFiles));
                 }}
@@ -1266,7 +1266,7 @@ export function CadetApp({ displayName }: { displayName: string }) {
                 accept={FILE_ACCEPT}
                 className="block w-full text-sm text-muted"
                 onChange={(event) => {
-                  const list = event.target.files;
+                  const list = Array.from(event.target.files ?? []);
                   event.target.value = "";
                   void run(() => addUploads(list, noteFiles, setNoteFiles));
                 }}
