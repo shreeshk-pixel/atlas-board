@@ -18,6 +18,7 @@ import {
   markAskOpened,
   noteAsk,
   saveAiPrefs,
+  setAttendance as saveAttendance,
   setPulseEnabled,
   summarizeNotes,
   updateAssignment,
@@ -31,11 +32,23 @@ type ClassRow = { id: string; day: string; time: string; subject: string; room: 
 type Assignment = { id: string; title: string; subject: string; due: string; done: boolean };
 type Course = { id: string; name: string; credits: number; grade: string };
 type Chat = { id: string; role: string; content: string };
+type AttendanceMark = { classId: string; day: string; status: "present" | "absent" | "none" };
+type PendingFile = {
+  id: string;
+  name: string;
+  kind: "text" | "image" | "file";
+  text?: string;
+  mime?: string;
+  data?: string;
+};
 type Tab = "overview" | "timetable" | "assignments" | "academics" | "ai" | "settings";
 
 const DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const GRADES = ["S", "A", "B", "C", "D", "E", "F"];
 const POINTS: Record<string, number> = { S: 10, A: 9, B: 8, C: 7, D: 6, E: 5, F: 0 };
+
+const FILE_ACCEPT =
+  ".pdf,.ppt,.pptx,.pptm,.doc,.docx,.txt,.md,.csv,.png,.jpg,.jpeg,.webp,.gif,image/*,application/pdf";
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "overview", label: "Overview" },
@@ -218,6 +231,72 @@ function skipSentence(day: string, label: string) {
   return `${when} this was ${label}. You didn't open it.`;
 }
 
+function kolkataToday() {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Kolkata",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date());
+}
+
+function shiftIso(iso: string, delta: number) {
+  const [year, month, day] = iso.split("-").map(Number);
+  const date = new Date(Date.UTC(year, (month || 1) - 1, day || 1));
+  date.setUTCDate(date.getUTCDate() + delta);
+  return date.toISOString().slice(0, 10);
+}
+
+function weekdayOf(iso: string) {
+  const [year, month, day] = iso.split("-").map(Number);
+  return ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][
+    new Date(Date.UTC(year, (month || 1) - 1, day || 1)).getUTCDay()
+  ];
+}
+
+function labelIso(iso: string) {
+  const [year, month, day] = iso.split("-").map(Number);
+  return new Date(Date.UTC(year, (month || 1) - 1, day || 1)).toLocaleDateString("en-IN", {
+    weekday: "short",
+    day: "numeric",
+    month: "short",
+    timeZone: "UTC",
+  });
+}
+
+function visibleChat(content: string) {
+  return content.split("\n\n<<atlas-files>>\n")[0];
+}
+
+function readUpload(file: File) {
+  const name = file.name || "file";
+  const ext = name.includes(".") ? (name.split(".").pop()?.toLowerCase() ?? "") : "";
+  const id = crypto.randomUUID();
+  if (file.type.startsWith("image/") || ["png", "jpg", "jpeg", "webp", "gif"].includes(ext)) {
+    return resizeImage(file).then((data) => ({ id, name, kind: "image" as const, mime: "image/jpeg", data }));
+  }
+  if (file.type.startsWith("text/") || ["txt", "md", "csv", "json", "log"].includes(ext)) {
+    return file.text().then((text) => {
+      if (text.length > 80000) throw new Error(`${name} is too long. Split it.`);
+      return { id, name, kind: "text" as const, text };
+    });
+  }
+  if (file.size > 2_200_000) throw new Error(`${name} is too large. Keep it under 2 MB.`);
+  return new Promise<PendingFile>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error(`Could not read ${name}`));
+    reader.onload = () =>
+      resolve({
+        id,
+        name,
+        kind: "file",
+        mime: file.type || "application/octet-stream",
+        data: String(reader.result),
+      });
+    reader.readAsDataURL(file);
+  });
+}
+
 function resizeImage(file: File) {
   return new Promise<string>((resolve, reject) => {
     const reader = new FileReader();
@@ -260,9 +339,16 @@ export function CadetApp({ displayName }: { displayName: string }) {
   const [busy, setBusy] = useState(false);
   const [notes, setNotes] = useState("");
   const [summary, setSummary] = useState("");
-  const [goal, setGoal] = useState("");
+  const [planDays, setPlanDays] = useState(7);
+  const [planUntil, setPlanUntil] = useState("");
+  const [topics, setTopics] = useState<string[]>([]);
+  const [topicDraft, setTopicDraft] = useState("");
   const [plan, setPlan] = useState("");
   const [question, setQuestion] = useState("");
+  const [chatFiles, setChatFiles] = useState<PendingFile[]>([]);
+  const [noteFiles, setNoteFiles] = useState<PendingFile[]>([]);
+  const [attendance, setAttendanceRows] = useState<AttendanceMark[]>([]);
+  const [attendDay, setAttendDay] = useState(kolkataToday);
   const [timetableText, setTimetableText] = useState("");
   const [timetableImage, setTimetableImage] = useState<string | null>(null);
   const [academicsText, setAcademicsText] = useState("");
@@ -291,6 +377,7 @@ export function CadetApp({ displayName }: { displayName: string }) {
     setFocusActive(board.focus.active);
     setFocusRecent(board.focus.recent);
     setFocusTotals(board.focus.totals);
+    setAttendanceRows(board.attendance);
   }
 
   useEffect(() => {
@@ -323,6 +410,79 @@ export function CadetApp({ displayName }: { displayName: string }) {
     if (low.focusMs * 2 >= high.focusMs) return null;
     return `${low.label} has less recorded time than ${high.label}.`;
   })();
+  const attendClasses = classes
+    .filter((row) => row.day === weekdayOf(attendDay) && row.subject.trim())
+    .slice()
+    .sort((a, b) => a.time.localeCompare(b.time));
+  const counted = attendance.filter((row) => row.status === "present" || row.status === "absent");
+  const presentCount = counted.filter((row) => row.status === "present").length;
+  const dayMarks = attendance.filter((row) => row.day === attendDay);
+  const dayPresent = dayMarks.filter((row) => row.status === "present").length;
+  const dayAbsent = dayMarks.filter((row) => row.status === "absent").length;
+  const attendLine = [
+    dayPresent || dayAbsent ? `${dayPresent} present · ${dayAbsent} absent` : "",
+    counted.length ? `${Math.round((100 * presentCount) / counted.length)}% overall` : "",
+  ]
+    .filter(Boolean)
+    .join(" · ");
+
+  function markAttendance(classId: string, status: "present" | "absent" | "none") {
+    const current = attendance.find((row) => row.classId === classId && row.day === attendDay)?.status;
+    const next = current === status ? "clear" : status;
+    setAttendanceRows((rows) => {
+      const rest = rows.filter((row) => !(row.classId === classId && row.day === attendDay));
+      return next === "clear" ? rest : [...rest, { classId, day: attendDay, status: next }];
+    });
+    void saveAttendance({ data: { classId, day: attendDay, status: next } })
+      .then((result) => {
+        if (!result.ok) setError(result.error);
+      })
+      .catch((err: unknown) => setError(err instanceof Error ? err.message : "Could not save attendance"));
+  }
+
+  async function addUploads(
+    list: FileList | null,
+    current: PendingFile[],
+    set: (files: PendingFile[]) => void,
+  ) {
+    if (!list?.length) return;
+    const next = [...current];
+    for (const file of Array.from(list)) {
+      if (next.length >= 4) throw new Error("Attach up to 4 files.");
+      next.push(await readUpload(file));
+    }
+    set(next);
+  }
+
+  async function sendChat() {
+    const prompt = question.trim();
+    const files = chatFiles.map(({ name, kind, text, mime, data }) => ({ name, kind, text, mime, data }));
+    if (!prompt && files.length === 0) return;
+    setQuestion("");
+    setChatFiles([]);
+    const result = await askAtlas({ data: { prompt, files } });
+    if (!result.ok) {
+      setError(result.error);
+      setQuestion(prompt);
+      setChatFiles(chatFiles);
+      return;
+    }
+    const visible = [prompt, files.length ? `Attached: ${files.map((file) => file.name).join(", ")}` : ""]
+      .filter(Boolean)
+      .join("\n\n");
+    setChat((rows) => [
+      ...rows,
+      { id: crypto.randomUUID(), role: "user", content: visible },
+      { id: crypto.randomUUID(), role: "assistant", content: result.reply },
+    ]);
+  }
+
+  function addTopic() {
+    const topic = topicDraft.trim();
+    if (!topic) return;
+    setTopics((rows) => (rows.length >= 24 ? rows : [...rows, topic.slice(0, 160)]));
+    setTopicDraft("");
+  }
 
   function keepMark(kind: string, refId: string, label: string) {
     const clean = label.trim();
@@ -453,6 +613,64 @@ export function CadetApp({ displayName }: { displayName: string }) {
                 {focusGap ? <p className="text-sm text-muted">{focusGap}</p> : null}
               </div>
             ) : null}
+            <section className="space-y-3">
+              <div className="flex flex-wrap items-end justify-between gap-3">
+                <div>
+                  <div className="text-xs tracking-[0.2em] text-muted uppercase">Attendance</div>
+                  <h2 className="mt-1 text-2xl font-medium tracking-tight">{labelIso(attendDay)}</h2>
+                </div>
+                <div className="flex gap-2">
+                  <GhostButton onClick={() => setAttendDay((day) => shiftIso(day, -1))}>Prev</GhostButton>
+                  <GhostButton onClick={() => setAttendDay(kolkataToday())}>Today</GhostButton>
+                  <GhostButton onClick={() => setAttendDay((day) => shiftIso(day, 1))}>Next</GhostButton>
+                </div>
+              </div>
+              {attendClasses.length === 0 ? (
+                <p className="text-sm text-muted">
+                  {classes.some((row) => row.subject.trim())
+                    ? "No classes on the timetable for this day."
+                    : "Import a timetable first. Attendance uses those classes."}
+                </p>
+              ) : (
+                <div>
+                  {attendClasses.map((row) => {
+                    const status = attendance.find((mark) => mark.classId === row.id && mark.day === attendDay)?.status;
+                    return (
+                      <div
+                        key={row.id}
+                        className="flex flex-col gap-2 border-b border-border py-2 sm:flex-row sm:items-center"
+                      >
+                        <div className="flex flex-wrap gap-1">
+                          {(
+                            [
+                              ["present", "Present"],
+                              ["absent", "Absent"],
+                              ["none", "No class"],
+                            ] as const
+                          ).map(([value, label]) => (
+                            <button
+                              key={value}
+                              type="button"
+                              onClick={() => markAttendance(row.id, value)}
+                              className={`inline-flex min-h-9 items-center px-2 text-xs tracking-[0.12em] uppercase ${
+                                status === value ? "bg-fg text-bg" : "border border-border text-muted"
+                              }`}
+                            >
+                              {label}
+                            </button>
+                          ))}
+                        </div>
+                        <p className="text-sm">
+                          <span className="tabular-nums text-muted">{row.time}</span> {row.subject}
+                          {row.room ? <span className="text-muted"> · {row.room}</span> : null}
+                        </p>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+              {attendLine ? <p className="text-sm text-muted">{attendLine}</p> : null}
+            </section>
             <div className="grid gap-4 md:grid-cols-3">
               <Card>
                 <div className="text-xs tracking-[0.16em] text-muted uppercase">CGPA</div>
@@ -914,6 +1132,7 @@ export function CadetApp({ displayName }: { displayName: string }) {
           <div className="grid gap-4 lg:grid-cols-2">
             <Card className="space-y-3 lg:col-span-2">
               <div className="text-xs tracking-[0.16em] text-muted uppercase">Ask anything</div>
+              <p className="text-sm text-muted">Attach a PDF, PowerPoint, Word file, text, or a photo.</p>
               <div className="h-72 space-y-3 overflow-y-auto border border-border bg-bg p-3 text-sm">
                 {chat.length === 0 ? (
                   <p className="pt-16 text-center text-muted">Ask about algorithms, OS, DBMS, networks.</p>
@@ -923,11 +1142,37 @@ export function CadetApp({ displayName }: { displayName: string }) {
                       key={message.id}
                       className={`whitespace-pre-wrap ${message.role === "user" ? "text-muted" : "text-fg"}`}
                     >
-                      {message.role === "user" ? "You" : "ATLAS"} — {message.content}
+                      {message.role === "user" ? "You" : "ATLAS"} — {visibleChat(message.content)}
                     </p>
                   ))
                 )}
               </div>
+              {chatFiles.length > 0 ? (
+                <div className="flex flex-wrap gap-2">
+                  {chatFiles.map((file) => (
+                    <button
+                      key={file.id}
+                      type="button"
+                      className="inline-flex min-h-9 items-center gap-2 border border-border px-2 text-xs text-muted"
+                      onClick={() => setChatFiles((rows) => rows.filter((item) => item.id !== file.id))}
+                    >
+                      {file.name}
+                      <span aria-hidden="true">×</span>
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+              <input
+                type="file"
+                multiple
+                accept={FILE_ACCEPT}
+                className="block w-full text-sm text-muted"
+                onChange={(event) => {
+                  const list = event.target.files;
+                  event.target.value = "";
+                  void run(() => addUploads(list, chatFiles, setChatFiles));
+                }}
+              />
               <div className="flex flex-col gap-2 sm:flex-row">
                 <input
                   className={inputClass}
@@ -937,43 +1182,10 @@ export function CadetApp({ displayName }: { displayName: string }) {
                   onKeyDown={(event) => {
                     if (event.key !== "Enter") return;
                     event.preventDefault();
-                    void run(async () => {
-                      const prompt = question.trim();
-                      if (!prompt) return;
-                      setQuestion("");
-                      const result = await askAtlas({ data: { prompt } });
-                      if (!result.ok) {
-                        setError(result.error);
-                        return;
-                      }
-                      setChat((rows) => [
-                        ...rows,
-                        { id: crypto.randomUUID(), role: "user", content: prompt },
-                        { id: crypto.randomUUID(), role: "assistant", content: result.reply },
-                      ]);
-                    });
+                    void run(sendChat);
                   }}
                 />
-                <PrimaryButton
-                  disabled={busy}
-                  onClick={() =>
-                    run(async () => {
-                      const prompt = question.trim();
-                      if (!prompt) return;
-                      setQuestion("");
-                      const result = await askAtlas({ data: { prompt } });
-                      if (!result.ok) {
-                        setError(result.error);
-                        return;
-                      }
-                      setChat((rows) => [
-                        ...rows,
-                        { id: crypto.randomUUID(), role: "user", content: prompt },
-                        { id: crypto.randomUUID(), role: "assistant", content: result.reply },
-                      ]);
-                    })
-                  }
-                >
+                <PrimaryButton disabled={busy} onClick={() => void run(sendChat)}>
                   Send
                 </PrimaryButton>
                 <GhostButton
@@ -993,15 +1205,48 @@ export function CadetApp({ displayName }: { displayName: string }) {
               <div className="text-xs tracking-[0.16em] text-muted uppercase">Notes</div>
               <textarea
                 className={`${inputClass} min-h-32 py-2`}
-                placeholder="Paste lecture notes"
+                placeholder="Paste lecture notes, or attach the file"
                 value={notes}
                 onChange={(event) => setNotes(event.target.value)}
+              />
+              {noteFiles.length > 0 ? (
+                <div className="flex flex-wrap gap-2">
+                  {noteFiles.map((file) => (
+                    <button
+                      key={file.id}
+                      type="button"
+                      className="inline-flex min-h-9 items-center gap-2 border border-border px-2 text-xs text-muted"
+                      onClick={() => setNoteFiles((rows) => rows.filter((item) => item.id !== file.id))}
+                    >
+                      {file.name}
+                      <span aria-hidden="true">×</span>
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+              <input
+                type="file"
+                multiple
+                accept={FILE_ACCEPT}
+                className="block w-full text-sm text-muted"
+                onChange={(event) => {
+                  const list = event.target.files;
+                  event.target.value = "";
+                  void run(() => addUploads(list, noteFiles, setNoteFiles));
+                }}
               />
               <PrimaryButton
                 disabled={busy}
                 onClick={() =>
                   run(async () => {
-                    const result = await summarizeNotes({ data: notes });
+                    const files = noteFiles.map(({ name, kind, text, mime, data }) => ({
+                      name,
+                      kind,
+                      text,
+                      mime,
+                      data,
+                    }));
+                    const result = await summarizeNotes({ data: { notes, files } });
                     if (!result.ok) setError(result.error);
                     else setSummary(result.text);
                   })
@@ -1012,18 +1257,86 @@ export function CadetApp({ displayName }: { displayName: string }) {
               {summary ? <p className="whitespace-pre-wrap text-sm text-fg">{summary}</p> : null}
             </Card>
             <Card className="space-y-3">
-              <div className="text-xs tracking-[0.16em] text-muted uppercase">7-day plan</div>
-              <input
-                className={inputClass}
-                placeholder="Finish DBMS internals before the IA"
-                value={goal}
-                onChange={(event) => setGoal(event.target.value)}
-              />
+              <div className="text-xs tracking-[0.16em] text-muted uppercase">Study plan</div>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <label className="block space-y-1">
+                  <span className="text-xs tracking-[0.16em] text-muted uppercase">Days</span>
+                  <input
+                    className={inputClass}
+                    type="number"
+                    min={1}
+                    max={90}
+                    value={planDays}
+                    onChange={(event) => {
+                      setPlanUntil("");
+                      setPlanDays(Number(event.target.value));
+                    }}
+                  />
+                </label>
+                <label className="block space-y-1">
+                  <span className="text-xs tracking-[0.16em] text-muted uppercase">Or finish by</span>
+                  <input
+                    className={inputClass}
+                    type="date"
+                    value={planUntil}
+                    onChange={(event) => {
+                      const value = event.target.value;
+                      setPlanUntil(value);
+                      if (!value) return;
+                      const left = daysUntil(value);
+                      if (left < 1) {
+                        setError("That date has already passed.");
+                        return;
+                      }
+                      if (left > 90) {
+                        setError("Keep the plan inside 90 days.");
+                        return;
+                      }
+                      setError("");
+                      setPlanDays(Math.min(90, left));
+                    }}
+                  />
+                </label>
+              </div>
+              <div className="flex flex-col gap-2 sm:flex-row">
+                <input
+                  className={inputClass}
+                  placeholder="Add a topic"
+                  value={topicDraft}
+                  onChange={(event) => setTopicDraft(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key !== "Enter") return;
+                    event.preventDefault();
+                    addTopic();
+                  }}
+                />
+                <GhostButton onClick={addTopic}>Add</GhostButton>
+              </div>
+              {topics.length > 0 ? (
+                <div className="space-y-1">
+                  {topics.map((topic, index) => (
+                    <div key={`${topic}-${index}`} className="flex items-center justify-between gap-3 text-sm">
+                      <span>
+                        {index + 1}. {topic}
+                      </span>
+                      <button
+                        type="button"
+                        className="inline-flex min-h-9 items-center text-xs tracking-[0.12em] text-muted uppercase"
+                        onClick={() => setTopics((rows) => rows.filter((_, item) => item !== index))}
+                      >
+                        Remove
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="text-sm text-muted">Add the topics this plan has to cover.</p>
+              )}
               <PrimaryButton
                 disabled={busy}
                 onClick={() =>
                   run(async () => {
-                    const result = await makeStudyPlan({ data: goal });
+                    const result = await makeStudyPlan({ data: { days: planDays, until: planUntil, topics } });
                     if (!result.ok) setError(result.error);
                     else setPlan(result.text);
                   })

@@ -1,4 +1,5 @@
 import { createMiddleware, createServerFn } from "@tanstack/react-start";
+import type { IncomingFile } from "./uploads.server";
 import { hashPassword } from "better-auth/crypto";
 import { auth } from "@/lib/auth/server";
 import { authMiddleware } from "@/lib/auth/middleware";
@@ -68,6 +69,17 @@ function kolkataDay() {
     month: "2-digit",
     day: "2-digit",
   }).format(new Date());
+}
+
+function utcDay(iso: string) {
+  const [year, month, day] = iso.split("-").map(Number);
+  return Date.UTC(year, (month || 1) - 1, day || 1);
+}
+
+function addIsoDays(iso: string, days: number) {
+  const date = new Date(utcDay(iso));
+  date.setUTCDate(date.getUTCDate() + days);
+  return date.toISOString().slice(0, 10);
 }
 
 function cleanAsk(input: { refKey?: string; label?: string; tab?: string }) {
@@ -568,6 +580,10 @@ export const loadBoard = createServerFn({ method: "GET" })
     const pref = await sql<{ enabled: boolean }>`
       select enabled from pulse_prefs where user_id = ${context.userId}
     `;
+    const focus = await focusBundle(sql, context.userId);
+    const attendance = await sql<{ class_id: string; day: string; status: string }>`
+      select class_id, day, status from attendance where user_id = ${context.userId}
+    `;
     return {
       classes,
       assignments: assignments.map((row) => ({ ...row, done: on(row.done) })),
@@ -590,7 +606,10 @@ export const loadBoard = createServerFn({ method: "GET" })
         personalHint: hint(prefs[0]?.api_key),
         sharedAvailable: Boolean(shared[0]?.api_key),
       },
-      focus: await focusBundle(sql, context.userId),
+      focus,
+      attendance: attendance
+        .filter((row) => row.status === "present" || row.status === "absent" || row.status === "none")
+        .map((row) => ({ classId: row.class_id, day: row.day, status: row.status as "present" | "absent" | "none" })),
     };
   });
 
@@ -885,12 +904,47 @@ async function callLLM(
   return { ok: true as const, text: String(text), source: creds.source };
 }
 
+async function takeFiles(files: IncomingFile[] | undefined) {
+  const { prepareFiles } = await import("./uploads.server");
+  return prepareFiles(files);
+}
+
+function modelContent(
+  prompt: string,
+  files: { label: string; text: string; image: string | null }[],
+) {
+  const dump = files
+    .map((file) => (file.text ? `--- ${file.label} ---\n${file.text}` : `--- ${file.label} (photo) ---`))
+    .join("\n\n")
+    .slice(0, 20000);
+  const text = [prompt, dump].filter(Boolean).join("\n\n");
+  const images = files.map((file) => file.image).filter((image): image is string => Boolean(image));
+  if (!images.length) return text;
+  return [
+    { type: "text" as const, text: text || "Look at the attached photos." },
+    ...images.map((url) => ({ type: "image_url" as const, image_url: { url } })),
+  ];
+}
+
+function storedTurn(prompt: string, files: { label: string; text: string }[]) {
+  const names = files.map((file) => file.label);
+  const visible = [prompt, names.length ? `Attached: ${names.join(", ")}` : ""].filter(Boolean).join("\n\n");
+  const dump = files
+    .map((file) => (file.text ? `--- ${file.label} ---\n${file.text}` : ""))
+    .filter(Boolean)
+    .join("\n\n")
+    .slice(0, 12000);
+  return dump ? `${visible}\n\n<<atlas-files>>\n${dump}` : visible;
+}
+
 export const askAtlas = createServerFn({ method: "POST" })
   .middleware([cadetGate])
-  .validator((input: { prompt: string }) => input)
+  .validator((input: { prompt: string; files?: IncomingFile[] }) => input)
   .handler(async ({ context, data }) => {
     const prompt = (data.prompt ?? "").trim();
-    if (!prompt) return fail("Type a question first.");
+    const prepared = await takeFiles(data.files);
+    if (!prepared.ok) return prepared;
+    if (!prompt && prepared.files.length === 0) return fail("Type a question or attach a file.");
     if (prompt.length > 4000) return fail("That question is too long.");
     const { sql } = await requireRole(context.userId, "cadet");
     const history = await sql<{ role: string; content: string }>`
@@ -899,11 +953,13 @@ export const askAtlas = createServerFn({ method: "POST" })
       order by created_at desc
       limit 20
     `;
+    const saved = storedTurn(prompt, prepared.files);
     const userId = crypto.randomUUID();
     await sql`
       insert into chats (id, user_id, role, content)
-      values (${userId}, ${context.userId}, 'user', ${prompt})
+      values (${userId}, ${context.userId}, 'user', ${saved})
     `;
+    const ask = prompt || "Read the attached files and answer. If they are notes, pull out what matters for an exam.";
     const result = await callLLM(
       sql,
       context.userId,
@@ -911,13 +967,13 @@ export const askAtlas = createServerFn({ method: "POST" })
         {
           role: "system",
           content:
-            "You are ATLAS, mission control for an Information Science & Engineering student. Answer clearly, with examples and short exam tips when they help. Be direct.",
+            "You are ATLAS, mission control for an Information Science & Engineering student. Answer clearly, with examples and short exam tips when they help. Be direct. When files are attached, use them.",
         },
         ...history.reverse().map((row) => ({ role: row.role, content: row.content })),
-        { role: "user", content: prompt },
+        { role: "user", content: modelContent(ask, prepared.files) },
       ],
       0.4,
-      800,
+      900,
     );
     if (!result.ok) {
       await sql`delete from chats where id = ${userId} and user_id = ${context.userId}`;
@@ -941,11 +997,13 @@ export const clearChat = createServerFn({ method: "POST" })
 
 export const summarizeNotes = createServerFn({ method: "POST" })
   .middleware([cadetGate])
-  .validator((notes: string) => notes)
-  .handler(async ({ context, data: notes }) => {
-    const text = (notes ?? "").trim();
-    if (!text) return fail("Paste some notes first.");
-    if (text.length > 12000) return fail("Those notes are too long. Split them.");
+  .validator((input: { notes: string; files?: IncomingFile[] }) => input)
+  .handler(async ({ context, data }) => {
+    const notes = (data.notes ?? "").trim();
+    const prepared = await takeFiles(data.files);
+    if (!prepared.ok) return prepared;
+    if (!notes && prepared.files.length === 0) return fail("Paste notes or attach a file.");
+    if (notes.length > 12000) return fail("Those notes are too long. Split them.");
     const { sql } = await requireRole(context.userId, "cadet");
     const result = await callLLM(
       sql,
@@ -954,12 +1012,15 @@ export const summarizeNotes = createServerFn({ method: "POST" })
         {
           role: "system",
           content:
-            "Summarize engineering lecture notes into key points, formulas, and exam-relevant concepts. Use short sections. No fluff.",
+            "Summarize engineering lecture notes into key points, formulas, and exam-relevant concepts. Use short sections. No fluff. Use the pasted notes and any attached files.",
         },
-        { role: "user", content: text },
+        {
+          role: "user",
+          content: modelContent(notes || "Summarize the attached files.", prepared.files),
+        },
       ],
       0.3,
-      800,
+      1000,
     );
     if (!result.ok) return result;
     return { ok: true as const, text: result.text, source: result.source };
@@ -967,15 +1028,21 @@ export const summarizeNotes = createServerFn({ method: "POST" })
 
 export const makeStudyPlan = createServerFn({ method: "POST" })
   .middleware([cadetGate])
-  .validator((goal: string) => goal)
-  .handler(async ({ context, data: goal }) => {
-    const text = (goal ?? "").trim();
-    if (!text) return fail("Say what you need to finish.");
+  .validator((input: { days: number; until: string; topics: string[] }) => input)
+  .handler(async ({ context, data }) => {
+    const topics = (data.topics ?? []).map((topic) => topic.trim()).filter(Boolean).slice(0, 24);
+    if (!topics.length) return fail("Add at least one topic.");
+    const today = kolkataDay();
+    const until = (data.until ?? "").trim();
+    let days = Math.round(Number(data.days));
+    if (/^\d{4}-\d{2}-\d{2}$/.test(until)) {
+      days = Math.round((utcDay(until) - utcDay(today)) / 86400000);
+      if (days < 1) return fail("That date has already passed.");
+    }
+    if (!Number.isFinite(days) || days < 1 || days > 90) return fail("Set the days between 1 and 90.");
     const { sql } = await requireRole(context.userId, "cadet");
-    const subjects = await sql<{ subject: string }>`
-      select subject from classes where user_id = ${context.userId} and subject <> ''
-    `;
-    const names = [...new Set(subjects.map((row) => row.subject))].slice(0, 12);
+    const end = addIsoDays(today, days - 1);
+    const list = topics.map((topic, index) => `${index + 1}. ${topic.slice(0, 160)}`).join("\n");
     const result = await callLLM(
       sql,
       context.userId,
@@ -983,18 +1050,49 @@ export const makeStudyPlan = createServerFn({ method: "POST" })
         {
           role: "system",
           content:
-            "Write a realistic 7-day study plan for an ISE student. Daily targets, specific topics, one revision slot. Tight and actionable.",
+            "Write a study plan for an ISE student. Use exactly the number of days given, from the start date through the end date. Cover only the topics the student listed. Each day: the topic, one concrete task, and a short revision of an earlier topic once one exists. Tight. No pep talk.",
         },
         {
           role: "user",
-          content: `Goal: ${text.slice(0, 500)}. Subjects on the timetable: ${names.join(", ") || "not set yet"}.`,
+          content: `Start: ${today}. End: ${end}. Days: ${days}.\nTopics:\n${list}`,
         },
       ],
       0.4,
-      900,
+      1200,
     );
     if (!result.ok) return result;
     return { ok: true as const, text: result.text, source: result.source };
+  });
+
+export const setAttendance = createServerFn({ method: "POST" })
+  .middleware([cadetGate])
+  .validator((input: { classId: string; day: string; status: string }) => input)
+  .handler(async ({ context, data }) => {
+    const classId = (data.classId ?? "").trim();
+    const day = (data.day ?? "").trim();
+    const status = (data.status ?? "").trim();
+    if (!classId || !/^\d{4}-\d{2}-\d{2}$/.test(day)) return fail("That attendance mark is not valid.");
+    if (status !== "present" && status !== "absent" && status !== "none" && status !== "clear") {
+      return fail("Pick present, absent, or no class.");
+    }
+    const { sql } = await requireRole(context.userId, "cadet");
+    const owned = await sql<{ id: string }>`
+      select id from classes where id = ${classId} and user_id = ${context.userId}
+    `;
+    if (!owned[0]) return fail("That class is not on your timetable.");
+    if (status === "clear") {
+      await sql`
+        delete from attendance
+        where user_id = ${context.userId} and class_id = ${classId} and day = ${day}
+      `;
+      return { ok: true as const };
+    }
+    await sql`
+      insert into attendance (user_id, class_id, day, status)
+      values (${context.userId}, ${classId}, ${day}, ${status})
+      on conflict (user_id, class_id, day) do update set status = excluded.status
+    `;
+    return { ok: true as const };
   });
 
 function normalizeDay(raw: string) {
