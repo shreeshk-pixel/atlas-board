@@ -107,11 +107,7 @@
     "directories": {
       "output": "dist-desktop"
     },
-    "files": [
-      "desktop/**/*",
-      ".output/**/*",
-      "package.json"
-    ],
+    "files": ["desktop/**/*", ".output/**/*", "package.json", "!node_modules/**"],
     "win": {
       "target": [
         {
