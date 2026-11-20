@@ -107,8 +107,9 @@
     "directories": {
       "output": "dist-desktop"
     },
-    "files": ["desktop/**/*", ".output/**/*", "package.json", "!node_modules/**"],
+    "files": ["desktop/**/*", "package.json"],
     "win": {
+      "signAndEditExecutable": false,
       "target": [
         {
           "target": "zip",
